@@ -1,21 +1,23 @@
 [project]
 name = "pytruffle"
 version = "0.1.0"
-description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "jinja2>=3.1.5",
     "openai>=1.58.1",
     "pydantic>=2.10.4",
 ]
-authors = [
-    "Gerhard Stenzel <gerhard.stenzel@ifi.lmu.de>"
-]
-license = "MIT"
+authors = [{ name = "Gerhard Stenzel", email = "gerhard.stenzel@ifi.lmu.de" },]
+license = { text = "MIT" }
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+haystack = [
+    "haystack-ai>=2.8.0",
 ]
 
 [tool.ruff]
@@ -38,3 +40,8 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["src/pytruffle/",]
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

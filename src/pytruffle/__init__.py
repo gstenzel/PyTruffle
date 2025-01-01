@@ -1,42 +1,118 @@
+import abc
 import ast
 import asyncio
 import hashlib
 import json
 import logging
 import os
-import typing
-from enum import Enum
 from pathlib import Path
-
+from typing import Any, Coroutine, List, Literal, Tuple, Type
+import dataclasses
+import jinja2
 import openai
 import pydantic
 
-__all__ = ["Store", "FileFragmentFormatter", "LLMPromts", ""]
+__all__ = ["Store", "FileFragmentFormatter", "Prompts"]
 
 logger = logging.getLogger(__name__)
 
 
-class RetrievalMethod(Enum):
-    AST = "ast"
-    FULL = "full"
+@dataclasses.dataclass
+class Prompts:
+    summarize_dir_sys: str = """
+You are a world-class software developer. Your task is to provide a concise overview of a directory that contains multiple files, each of which has already been summarized.
+
+Instructions:
+- Start your reply with: "The directory '{{ identifier }}' contains ..."
+- Summarize the purpose of the directory and the files it contains.
+- Keep the overview concise and in simple language (aim for 3–5 sentences total).
+- Do not include unnecessary details or large code excerpts.
+
+"""
+    summarize_dir_user: str = """
+The files are:
+{% for child in children %}
+- {{ child.get_id() }}: {{ child.get_summary() }}
+{% endfor %}
+Now, summarize the directory. The directory '{{ identifier }}' contains ...
+"""
+    summarize_file_sys: str = """
+You are a world-class software developer. Your task is to provide a concise overview of a file that contains multiple code blocks, each of which has already been summarized.
+
+Instructions:
+- Start your reply with: "The file '{{ identifier }}' contains ..."
+- Summarize, what the combination of blocks does. Do not repeat the blocks verbatim.
+- Keep the overview concise and in simple language (aim for 3–5 sentences total).
+- Do not include unnecessary details or large code excerpts.
+"""
+    summarize_file_user: str = """
+The snippets are:
+{% for child in children %}
+- {{ child.get_id() }}: {{ child.get_summary() }}
+{% endfor %}
+Now, summarize the file. The file '{{ identifier }}' contains ...
+"""
+    summarize_file_fragment_sys: str = """
+You are a world-class software developer. Your task is to provide a concise overview of a file that contains multiple code blocks, each of which has already been summarized. 
+
+Instructions:
+- Start your reply with: "The file  block '{{ identifier }}' contains ..."
+- Summarize, what the combination of blocks does. Do not repeat the blocks verbatim.
+- Keep the overview concise and in simple language (aim for 3–5 sentences total).
+- Do not include unnecessary details or large code excerpts.
+"""
+    summarize_file_fragment_user: str = """
+The code block is:
+
+```python
+{{ code }}
+```
+
+Now, summarize the snippet. The file '{{ identifier }}' contains ...
+                              
+"""
+    query_dir_sys: str = """
+You are a world-class software developer. We need to find the relevant files in the directory '{{ identifier }}' that contain the information you are looking for. The query is: {{ query }}.
+
+Instructions:
+- Select the files that contain the information you are looking for.
+- Make sure to select all relevant files, but no more than necessary.
+- If you are unsure, select the files that you think are most likely to contain the information you are looking for.
+"""
+    query_dir_user: str = """
+The files are:
+{% for child in children %}
+- {{ child.get_id() }}: {{ child.get_summary() }}
+{% endfor %}
+Now, select the files that contain the information you are looking for. The query is: {{ query }}
+"""
+    query_file_sys: str = """
+You are a software dev. The current file contains multiple code blocks: {% for child in children %}\n{{ child.get_id() }}{% endfor %}. Which are relevant for the query? The query is: {{ query }}
+"""
+    query_file_user: str = """
+The snippets are:
+{% for child in children %}
+    {{ child.get_id() }}: {{ child.summary }}
+{% endfor %}
+
+Which code blocks are relevant for the query? The query is: {{ query }}
+"""
+
+    @classmethod
+    def fill(cls, prompt: str, **kwargs) -> str:
+        return jinja2.Template(prompt).render(kwargs)
 
 
-@pydantic.dataclasses.dataclass
-class LLMPromts:
-    prompt_summarize_filefragment_system: str = "You are a software dev. Summarize the code."
-    prompt_summarize_filefragment_user: str = "The code is:"
-    prompt_summarize_file_system: str = "You are a software dev. Summarize these code snippets."
-    prompt_summarize_file_user: str = "The snippets are:"
-    prompt_summarize_dir_system: str = "You are a software dev. Summarize this code directory."
-    prompt_summarize_dir_user: str = "The directory contains:"
-
-    prompt_query_file_system: str = "You are a software dev. Which of the code snippets are relevant for the query? Select only the relevant ones."
-    prompt_query_file_user: str = "The query is:"
-    prompt_query_dir_system: str = "You are a software dev. Which of the code files are relevant for the query? Select only the relevant ones."
-    prompt_query_dir_user: str = "The query is:"
+@dataclasses.dataclass
+class _LLMConfig:
+    model: str
+    llm_query_args: dict
+    llm_sum_args: dict
+    openai_client: openai.AsyncOpenAI
+    prompts: Prompts
 
 
-def _get_file_selection_class(all_files: typing.List[str]) -> typing.Type:
+def _get_file_selection_class(all_files: List[str]) -> Type:
     annotations = {
         file: (bool, pydantic.Field(default=True, title="Is this file relevant?"))
         for file in all_files
@@ -51,13 +127,13 @@ def _get_file_selection_class(all_files: typing.List[str]) -> typing.Type:
         },
     )
 
-    def to_list(selectable_files: SelectableFiles) -> typing.List[str]:
+    def to_list(selectable_files: SelectableFiles) -> List[str]:
         return [file for file, selected in selectable_files.model_dump().items() if selected]
 
     return SelectableFiles, to_list
 
 
-def _read(path: Path, lines: typing.Tuple[int, int] = (0, -1)) -> str:
+def _read(path: Path, lines: Tuple[int, int] = (0, -1)) -> str:
     with open(path, "r") as f:
         try:
             if lines[1] == -1:
@@ -72,49 +148,101 @@ def _read(path: Path, lines: typing.Tuple[int, int] = (0, -1)) -> str:
             return f.read().decode("utf-8")
 
 
-class _FileFragment:
+class Summarizable:
+    def __init__(
+        self,
+        path,
+        root_path,
+        formatter,
+        llm_config: _LLMConfig,
+    ):
+        self.formatter = formatter
+        self.llm = llm_config
+        self.summary = None
+        self.identifier = None
+        self.path = path
+        self.root_path = root_path
+        self.relative_path = str(path.relative_to(root_path).as_posix())
+
+    @abc.abstractmethod
+    async def summarize(self) -> Coroutine[Any, Any, str]: ...
+
+    @abc.abstractmethod
+    def to_dict(self) -> dict: ...
+
+    @abc.abstractmethod
+    def from_dict(self, data) -> None: ...
+
+    @abc.abstractmethod
+    def get_id(self) -> str: ...
+
+    def get_summary(self) -> str:
+        if self.summary is None:
+            raise ValueError("Summary not set")
+        return self.summary
+
+    async def _llm_sum(self, system, user):
+        completion = await self.llm.openai_client.beta.chat.completions.parse(
+            model=self.llm.model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            **self.llm.llm_sum_args,
+        )
+        return completion.choices[0].message.content
+
+    async def _llm_query(self, user, system, selectable_type):
+        completion = await self.llm.openai_client.beta.chat.completions.parse(
+            model=self.llm.model,
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": user,
+                },
+            ],
+            response_format=selectable_type,
+            **self.llm.llm_query_args,
+        )
+        content = completion.choices[0].message.content
+        return selectable_type.model_validate_json(content)
+
+
+class _FileFragment(Summarizable):
     def __init__(
         self,
         path: Path,
         root_path: Path,
-        prompts: LLMPromts,
-        lines: typing.Tuple[int, int] = (0, -1),
+        formatter: "FileFragmentFormatter",
+        llm_config: _LLMConfig,
+        lines: Tuple[int, int] = (0, -1),
         node_type: str = None,
     ):
+        super().__init__(path, root_path, formatter, llm_config)
         content = _read(path, lines)
         self.path = path
         self.lines = lines
-        self.root_path = root_path
-        self.relative_path = str(path.relative_to(root_path).as_posix())
         self.hash_ = hashlib.sha256(
             content.encode("utf-8") + self.relative_path.encode() + str(lines).encode("utf-8")
         ).digest()
-        self.summary = None
-        self.prompts = prompts
         self.node_type = node_type
 
     async def summarize(
         self,
-        openai_client,
-        model,
-        llm_args={},
-    ):
+    ) -> Coroutine[Any, Any, str]:
         content = _read(self.path, self.lines)
-        completion = await openai_client.beta.chat.completions.parse(
-            model=model,
-            messages=[
-                {"role": "system", "content": self.prompts.prompt_summarize_filefragment_system},
-                {
-                    "role": "user",
-                    "content": self.prompts.prompt_summarize_filefragment_user + content,
-                },
-            ],
-            **llm_args,
+        self.summary = await self._llm_sum(
+            Prompts.fill(self.llm.prompts.summarize_file_fragment_sys, identifier=self.get_id()),
+            Prompts.fill(
+                self.llm.prompts.summarize_file_fragment_user,
+                identifier=self.get_id(),
+                code=content,
+            ),
         )
-        self.summary = completion.choices[0].message.content
         return self.summary
 
-    def to_dict(self):
+    def to_dict(self) -> dict:
         return {
             "relative_path": self.relative_path,
             "summary": self.summary,
@@ -122,87 +250,120 @@ class _FileFragment:
             "lines": self.lines,
         }
 
-    def from_dict(self, data):
+    def from_dict(self, data) -> None:
         assert self.hash_.hex() == data["hash"]
         assert tuple(self.lines) == tuple(data["lines"])
         assert self.relative_path == data["relative_path"]
         self.summary = data["summary"]
 
+    def get_id(self) -> str:
+        if self.identifier is None:
+            raise ValueError("Identifier not set")
+        return self.identifier
 
-class _Directory:
+    def format(self) -> str:
+        return self.formatter.format(self)
+
+
+class _File(Summarizable):
     def __init__(
         self,
         path: Path,
         root_path: Path,
-        all_files: typing.List[str],
-        retrieval_method: RetrievalMethod,
-        prompts: LLMPromts,
+        retrieval_method: Literal["ast", "full"],
+        formatter: "FileFragmentFormatter",
+        llm_config: _LLMConfig,
     ):
-        self.path = path
-        self.relative_path = str(path.relative_to(root_path).as_posix())
+        super().__init__(path, root_path, formatter, llm_config)
+        self.retrieval_method = retrieval_method
         self.children = []
-        for child in path.iterdir():
-            if child.is_dir():
-                sub_dir = _Directory(child, root_path, all_files, retrieval_method, prompts)
-                if len(sub_dir.children) > 0:
-                    self.children.append(sub_dir)
-            elif child.is_file():
-                if not all_files or child.relative_to(root_path).as_posix() in all_files:
-                    self.children.append(_File(child, root_path, retrieval_method, prompts))
-            else:
-                logger.warning(f"Skipping {child} as it is not a file or directory")
-        self.summary = None
-        self.prompts = prompts
+        ffargs = {
+            "path": path,
+            "root_path": root_path,
+            "formatter": formatter,
+            "llm_config": llm_config,
+        }
+        if retrieval_method == "full" or path.suffix != ".py":
+            ff = _FileFragment(**ffargs, lines=(0, -1))
+            ff.identifier = ff.relative_path
+            self.children.append(ff)
+        elif retrieval_method == "ast":
+            try:
+                self.children = _File._split_code(ffargs)
+            except Exception as e:
+                logger.warning(f"Could not split {path} into code fragments: {e}")
+                raise e
+        else:
+            raise ValueError(f"Invalid retrieval method {retrieval_method}")
         child_hashes = [child.hash_ for child in self.children]
         self.hash_ = hashlib.sha256(b"".join(child_hashes) + self.relative_path.encode()).digest()
+        self.size = len(self.children)
+        self.get_id = lambda: self.relative_path
 
-    async def summarize(self, openai_client, model, llm_args={}) -> str:
-        await asyncio.gather(
-            *[child.summarize(openai_client, model, llm_args) for child in self.children]
-        )
+    @staticmethod
+    def _split_code(ffargs: dict) -> List[_FileFragment]:
+        filefull = _read(ffargs["path"])
+        tree = ast.parse(filefull)
+        docs = [
+            _FileFragment(
+                **ffargs, lines=(node.lineno - 1, node.end_lineno), node_type=type(node).__name__
+            )
+            for node in tree.body
+        ]
+        docs2, cache = [], []
 
-        summaries = [child.summary for child in self.children if child.summary is not None]
-        completion = await openai_client.beta.chat.completions.parse(
-            model=model,
-            messages=[
-                {"role": "system", "content": self.prompts.prompt_summarize_dir_system},
-                {
-                    "role": "user",
-                    "content": self.prompts.prompt_summarize_dir_user + "\n".join(summaries),
-                },
-            ],
-            **llm_args,
+        def cache_flush():
+            nonlocal cache
+            if len(cache) > 0:
+                docs2.append(
+                    _FileFragment(
+                        **ffargs, lines=(cache[0].lines[0], cache[-1].lines[1]), node_type="block"
+                    )
+                )
+            cache = []
+
+        for doc in docs:
+            if doc.node_type in ["FunctionDef", "ClassDef"]:
+                cache_flush()
+                docs2.append(doc)
+            else:
+                cache.append(doc)
+        cache_flush()
+        for i, doc in enumerate(docs2):
+            doc.identifier = f"{doc.relative_path} Block {i}"
+        return docs2
+
+    async def summarize(self) -> Coroutine[Any, Any, str]:
+        await asyncio.gather(*[child.summarize() for child in self.children])
+        self.summary = await self._llm_sum(
+            Prompts.fill(self.llm.prompts.summarize_file_sys, identifier=self.get_id()),
+            Prompts.fill(
+                self.llm.prompts.summarize_file_user,
+                identifier=self.get_id(),
+                children=self.children,
+            ),
         )
-        self.summary = completion.choices[0].message.content
         return self.summary
 
-    async def query(
-        self, openai_client, model, query: str, llm_args={}
-    ) -> typing.List[_FileFragment]:
-        all_files = [child.relative_path for child in self.children]
-        selectable_type, selectable_fun = _get_file_selection_class(all_files)
-        completion = await openai_client.beta.chat.completions.parse(
-            model=model,
-            messages=[
-                {"role": "system", "content": self.prompts.prompt_query_dir_system},
-                {"role": "user", "content": self.prompts.prompt_query_dir_user + query},
-            ],
-            response_format=selectable_type,
-            **llm_args,
-        )
-        content = completion.choices[0].message.content
-        selected_files_str = selectable_fun(selectable_type.model_validate_json(content))
-        logger.debug(f"Selected files: {selected_files_str} from {all_files}")
-        selected_files = [
-            child for child in self.children if child.relative_path in selected_files_str
-        ]
-        recursive_files = await asyncio.gather(
-            *[child.query(openai_client, model, query, llm_args) for child in selected_files]
-        )
-        # flatten
-        return [item for sublist in recursive_files for item in sublist]
+    async def query(self, query: str) -> List[_FileFragment]:
+        if len(self.children) == 0:
+            return []
+        if len(self.children) == 1:
+            return [self.children[0]]
 
-    def to_dict(self):
+        all_fragments = [f"{c.relative_path} Block {i}" for i, c in enumerate(self.children)]
+        selectable_type, selectable_fun = _get_file_selection_class(all_fragments)
+        valid_content = await self._llm_query(
+            Prompts.fill(self.llm.prompts.query_file_sys, query=query, children=self.children),
+            Prompts.fill(self.llm.prompts.query_file_user, query=query, children=self.children),
+            selectable_type,
+        )
+        selected_fragments_str = selectable_fun(valid_content)
+        logger.debug(f"Selected fragments: {selected_fragments_str} from {all_fragments}")
+        selected_fragments = [self.children[int(f.split(" ")[-1])] for f in selected_fragments_str]
+        return selected_fragments
+
+    def to_dict(self) -> dict:
         return {
             "relative_path": self.relative_path,
             "children": [child.to_dict() for child in self.children],
@@ -219,99 +380,90 @@ class _Directory:
                 if child_data["hash"] == child.hash_.hex():
                     child.from_dict(child_data)
 
+    def get_id(self) -> str:
+        return self.relative_path
 
-class _File:
+
+class _Directory(Summarizable):
     def __init__(
-        self, path: Path, root_path: Path, retrieval_method: RetrievalMethod, prompts: LLMPromts
+        self,
+        path: Path,
+        root_path: Path,
+        all_files: List[str],
+        retrieval_method: Literal["ast", "full"],
+        formatter: "FileFragmentFormatter",
+        llm_config: _LLMConfig,
     ):
-        self.path = path
-        self.relative_path = str(path.relative_to(root_path).as_posix())
-        self.retrieval_method = retrieval_method
-        self.summary = None
+        super().__init__(path, root_path, formatter, llm_config)
         self.children = []
-        self.prompts = prompts
-        if retrieval_method == RetrievalMethod.FULL or path.suffix != ".py":
-            self.children.append(_FileFragment(path, root_path, prompts, lines=(0, -1)))
-        elif retrieval_method == RetrievalMethod.AST:
-            try:
-                self.children = _File._split_code(path, root_path, prompts)
-            except Exception as e:
-                logger.warning(f"Could not split {path} into code fragments: {e}")
-                raise e
-        else:
-            raise ValueError(f"Invalid retrieval method {retrieval_method}")
+        for child in path.iterdir():
+            if child.is_dir():
+                sub_dir = _Directory(
+                    child,
+                    root_path,
+                    all_files,
+                    retrieval_method,
+                    formatter,
+                    self.llm,
+                )
+                if len(sub_dir.children) > 0:
+                    self.children.append(sub_dir)
+            elif child.is_file():
+                if not all_files or child.relative_to(root_path).as_posix() in all_files:
+                    self.children.append(
+                        _File(
+                            child,
+                            root_path,
+                            retrieval_method,
+                            formatter,
+                            self.llm,
+                        )
+                    )
+            else:
+                logger.warning(f"Skipping {child} as it is not a file or directory")
         child_hashes = [child.hash_ for child in self.children]
         self.hash_ = hashlib.sha256(b"".join(child_hashes) + self.relative_path.encode()).digest()
+        self.size = sum([child.size for child in self.children])
 
-    @staticmethod
-    def _split_code(path: Path, root_path: Path, prompts: LLMPromts):
-        filefull = _read(path)
-        tree = ast.parse(filefull)
-        docs = [
-            _FileFragment(
-                path=path,
-                root_path=root_path,
-                prompts=prompts,
-                lines=(node.lineno - 1, node.end_lineno),
-                node_type=type(node).__name__,
-            )
-            for node in tree.body
-        ]
-        docs2, cache = [], []
+    def get_id(self) -> str:
+        return self.relative_path
 
-        def cache_flush():
-            nonlocal cache
-            if len(cache) > 0:
-                docs2.append(
-                    _FileFragment(
-                        path=cache[0].path,
-                        root_path=cache[0].root_path,
-                        prompts=cache[0].prompts,
-                        lines=(cache[0].lines[0], cache[-1].lines[1]),
-                        node_type="block",
-                    )
-                )
-            cache = []
-
-        for doc in docs:
-            if doc.node_type in ["FunctionDef", "ClassDef"]:
-                cache_flush()
-                docs2.append(doc)
-            else:
-                cache.append(doc)
-        cache_flush()
-        return docs2
-
-    async def summarize(self, openai_client, model, llm_args={}) -> str:
-        await asyncio.gather(
-            *[child.summarize(openai_client, model, llm_args) for child in self.children]
+    async def summarize(
+        self,
+    ) -> Coroutine[Any, Any, str]:
+        await asyncio.gather(*[child.summarize() for child in self.children])
+        self.summary = await self._llm_sum(
+            Prompts.fill(self.llm.prompts.summarize_dir_sys, identifier=self.get_id()),
+            Prompts.fill(
+                self.llm.prompts.summarize_dir_user,
+                identifier=self.get_id(),
+                children=self.children,
+            ),
         )
-        summaries = [child.summary for child in self.children if child.summary is not None]
-        completion = await openai_client.beta.chat.completions.parse(
-            model=model,
-            messages=[
-                {"role": "system", "content": self.prompts.prompt_summarize_file_system},
-                {
-                    "role": "user",
-                    "content": self.prompts.prompt_summarize_file_user + "\n".join(summaries),
-                },
-            ],
-            **llm_args,
-        )
-        self.summary = completion.choices[0].message.content
         return self.summary
 
-    async def query(
-        self, openai_client, model, query: str, llm_args={}
-    ) -> typing.List[_FileFragment]:
-        if len(self.children) == 0:
-            return []
-        if len(self.children) == 1:
-            return [self.children[0]]
-        else:
-            raise NotImplementedError("Querying multiple file fragments not implemented yet")
+    async def query(self, query: str) -> Coroutine[Any, Any, List[_FileFragment]]:
+        all_files = [child.relative_path for child in self.children]
+        selectable_type, selectable_fun = _get_file_selection_class(all_files)
+        valid_content = await self._llm_query(
+            Prompts.fill(self.llm.prompts.query_dir_sys, query=query, identifier=self.get_id()),
+            Prompts.fill(
+                self.llm.prompts.query_dir_user,
+                query=query,
+                identifier=self.get_id(),
+                children=self.children,
+            ),
+            selectable_type,
+        )
+        selected_files_str = selectable_fun(valid_content)
+        logger.debug(f"Selected files: {selected_files_str} from {all_files}")
+        selected_files = [
+            child for child in self.children if child.relative_path in selected_files_str
+        ]
+        recursive_files = await asyncio.gather(*[child.query(query) for child in selected_files])
+        return [item for sublist in recursive_files for item in sublist]
 
-    def to_dict(self):
+    def to_dict(self) -> dict:
         return {
             "relative_path": self.relative_path,
             "children": [child.to_dict() for child in self.children],
@@ -319,7 +471,7 @@ class _File:
             "hash": self.hash_.hex(),
         }
 
-    def from_dict(self, data):
+    def from_dict(self, data) -> None:
         assert self.hash_.hex() == data["hash"]
         assert self.relative_path == data["relative_path"]
         self.summary = data["summary"]
@@ -334,10 +486,12 @@ class FileFragmentFormatter:
         self.show_line_nums = show_line_nums
         self.format_as_code_block = format_as_code_block
 
-    def format(self, file_fragment: _FileFragment) -> str:
+    def format(self, file_fragment: _FileFragment | List[_FileFragment]) -> str:
+        if isinstance(file_fragment, list):
+            return "\n\n".join([self.format(f) for f in file_fragment])
         content = _read(file_fragment.path, file_fragment.lines)
         fp1 = file_fragment.lines[1] if file_fragment.lines[1] > 0 else len(content.split("\n"))
-        outp = f"File {file_fragment.relative_path} (lines {file_fragment.lines[0]}-{fp1}):\n"
+        outp = f"File {file_fragment.get_id()} (lines {file_fragment.lines[0]}-{fp1}):\n"
         if self.format_as_code_block:
             outp += "```python\n"
         padding = len(str(fp1))
@@ -353,13 +507,15 @@ class FileFragmentFormatter:
 class Store:
     def __init__(
         self,
-        dir_path: typing.Union[str, Path],
-        retrieval_method: RetrievalMethod = RetrievalMethod.FULL,
+        dir_path: str | Path,
+        retrieval_method: Literal["ast", "full"] = "full",
         openai_client: openai.AsyncOpenAI = None,
         model: str = None,
-        prompts: LLMPromts = LLMPromts(),
+        prompts: Prompts = Prompts(),
         cache_summaries: bool = True,
-        formatter: typing.Optional[FileFragmentFormatter] = FileFragmentFormatter(),
+        formatter: FileFragmentFormatter = FileFragmentFormatter(),
+        llm_query_args={},
+        llm_sum_args={},
     ):
         self.dir_path = Path(dir_path)
         logger.debug(f"Creating Store object for {self.dir_path}")
@@ -382,19 +538,32 @@ class Store:
         if all_files[0].startswith("fatal:"):
             logger.warning(f"Directory {self.dir_path} is not a git repository. Using all files.")
             all_files = None
-        self.root = _Directory(self.dir_path, self.dir_path, all_files, retrieval_method, prompts)
+        self.llm_config = _LLMConfig(
+            model=model,
+            llm_query_args=llm_query_args,
+            llm_sum_args=llm_sum_args,
+            openai_client=openai_client,
+            prompts=prompts,
+        )
+        self.root = _Directory(
+            self.dir_path, self.dir_path, all_files, retrieval_method, formatter, self.llm_config
+        )
 
         if self.cache_summaries:
             cache_file = f"truffle_{self.root.hash_.hex()}.json"
-            try:
-                with open(cache_file, "r") as f:
-                    self.root.from_dict(json.load(f))
-            except FileNotFoundError:
-                asyncio.run(self.root.summarize(openai_client, model))
+            if not os.path.exists(cache_file):
+                logger.debug(f"Cache file {cache_file} not found. Summarizing and caching.")
+                asyncio.run(self.root.summarize())
                 with open(cache_file, "w") as f:
                     json.dump(self.root.to_dict(), f)
+            else:
+                with open(cache_file, "r") as f:
+                    data = json.load(f)
+                    self.root.from_dict(data)
+        else:
+            asyncio.run(self.root.summarize())
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         outp = f"Store for {self.dir_path}"
 
         def _repr(node, outp, depth=0):
@@ -406,9 +575,34 @@ class Store:
 
         return _repr(self.root, outp)
 
-    async def query(self, query: str, llm_args={}):
-        files = await self.root.query(self.openai_client, self.model, query, llm_args)
+    async def query(self, query: str, return_raw=False) -> Coroutine[Any, Any, str | List[str]]:
+        files = await self.root.query(query)
+        if return_raw:
+            return files
         if self.formatter is not None:
-            return "\n".join([self.formatter.format(file) for file in files])
+            return "\n\n".join([self.formatter.format(file) for file in files])
         else:
             return [f.relative_path for f in files]
+
+
+def get_haystack_interface():
+    try:
+        import haystack
+    except ImportError:
+        raise ImportError(
+            "Please use `pip install pytruffle[haystack]` to use the haystack integration."
+        )
+
+    @haystack.component
+    class CombinedCodemapStoreRetriever(Store):
+        @haystack.component.output_types(documents=List[haystack.Document])
+        def run(self, query: str):
+            frags = asyncio.run(self.query(query, return_raw=True))
+            docs = []
+            for frag in frags:
+                docs.append(
+                    haystack.Document(text=_read(frag.path, frag.lines), meta=frag.to_dict())
+                )
+            return docs
+
+    return CombinedCodemapStoreRetriever
