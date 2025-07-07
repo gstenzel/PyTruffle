@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import subprocess
 from pathlib import Path
 from typing import Any, Coroutine, List, Literal, Tuple, Type
 import dataclasses
@@ -525,17 +526,24 @@ class Store:
         if openai_client is None:
             base_url = os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1/"
             api_key = os.getenv("OPENAI_API_KEY") or None
-            assert not (
-                base_url == "https://api.openai.com/v1/" and api_key is None
-            ), "OpenAI API Key not provided"
+            assert not (base_url == "https://api.openai.com/v1/" and api_key is None), (
+                "OpenAI API Key not provided"
+            )
             openai_client = openai.AsyncOpenAI(base_url=base_url, api_key=api_key)
         self.openai_client = openai_client
         if model is None:
             model = os.getenv("OPENAI_MODEL")
             assert model is not None, "OpenAI Model not provided"
         self.model = model
-        all_files = os.popen(f"git -C {self.dir_path} ls-files").read().strip().split("\n")
-        if all_files[0].startswith("fatal:"):
+        try:
+            res = subprocess.run(
+                ["git", "-C", str(self.dir_path), "ls-files"],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            all_files = res.stdout.strip().split("\n")
+        except (subprocess.CalledProcessError, FileNotFoundError):
             logger.warning(f"Directory {self.dir_path} is not a git repository. Using all files.")
             all_files = None
         self.llm_config = _LLMConfig(
