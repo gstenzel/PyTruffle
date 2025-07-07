@@ -31,7 +31,7 @@ blocks = asyncio.run(query)
 The haystack version can be installed using `pip install pytruffle[haystack]`.
 
 ```python
-import pytruflle
+import pytruffle
 import haystack
 
 store = pytruffle.get_haystack_interface()(repo_directory) # other kwargs can be passed here
